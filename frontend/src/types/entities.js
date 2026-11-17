@@ -1,2 +1,2 @@
-/** Sample:{id,code,title,quantity,location}; Transfer:{id,code,sample_id,destination,quantity,note}; Trial:{id,name,transfer_id,timeout_ms,status,result,error} */
-export const entityNames=['samples','transfers','trials'];
+/** Sample:{id,code,title,quantity,quantity_version,location}; Transfer:{id,code,sample_id,destination,quantity,note,invalidated,invalid_reason,invalidated_at}; Trial:{id,name,transfer_id,timeout_ms,status,result,error}; InventoryCount:{id,batch_code,status,note,frozen_at,posted_at,failed_reason,summary,lines}; InventoryCountLine:{id,count_id,sample_id,sample_code,frozen_quantity,frozen_version,current_quantity,physical_quantity,result,note} */
+export const entityNames=['samples','transfers','trials','counts'];

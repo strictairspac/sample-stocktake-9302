@@ -7,6 +7,7 @@
 团队原先通过纸质交接单、SQL 截图和 Excel 交接。三处痛点：样本版本难统一、并发移交容易重复、超时后无法确认回执是否回滚。上游为样本接收记录，本站承接样本登记、移交申请、并发复核和证据导出，下游为理化检测室与复核员。
 
 - 样本台账：批次、可用份数、保管位置，可录入。
+- 整库盘点：冻结同一时刻的全部样本及数量，录入实盘量后整批落账或整批拒绝。
 - 流转申请：关联样本、指定数量和接收实验室。
 - 并发执行：Redis 队列、独立 Python worker、可设锁等待上限。
 - 冲突证据：Backend PID、SQLSTATE、回执回滚、数量守恒与 JSON 导出。
@@ -32,6 +33,19 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 09:00 operator 登录；09:05 复核 `QY-261117-A` 近海水质留样 120 份，位置冷藏间 A-03；09:10 查看申请 `MOVE-1117-01`，接收理化检测室 30 份；09:15 新建 `shift-20261117` 流转申请；09:20 以该申请发起 250ms 并发演练；09:25 查看 A 提交 30、B SQLSTATE 55P03 回滚，90+30=120；09:30 导出 `trial-1.json`；09:40 viewer 复核证据；10:00 admin 查看审计。
 
+## 整库盘点
+
+盘点批次在发起时以 REPEATABLE READ 事务冻结当时存在的全部样本（编号、名称、数量、`quantity_version`），此后新登记的样本不纳入本批；日常登记、改量与申请照常进行。
+
+- 录入实盘量后「整批落账」：整批在一个数据库事务内完成调量、失效移交申请与审计，任一步失败都整体回滚，可安全重试。
+- 冻结后任一样本改过可用量（`quantity_version` 变化，改走再改回也会被发现）→ 整批拒绝，所有样本原库存不变，批次记为「冲突拒绝」并保留原因；被拒批次不能再次落账，需重新发起。
+- 任一样本存在排队中/执行中的演练 → 整批拒绝；已发起演练的样本不会再被盘点改量。
+- 落账与演练发起都会先锁样本行（按 id 排序），并发时以先提交者为准：落账先完成则超量申请失效、演练发起返回 409「已失效」；演练先完成则批次整批拒绝。
+- 落账成功时，同批样本中移交量大于盘后可用量的流转申请自动失效（`invalidated`），失效申请不能发起演练。
+- 同一批次重复 POST 落账是幂等的：不重复调量、不再写审计；中断后的重试同样不会留下半截状态。
+
+接口：`GET /counts`、`GET /counts/{id}`、`POST /counts`（冻结）、`PUT /counts/{id}/lines`（录入实盘量）、`POST /counts/{id}/post`（整批落账）。页面「整库盘点」显示待盘、冲突、已落账及原因。
+
 ## 算法与业务边界
 
 这是**真实数据库行锁的受控演练**。每次以样本可用量建立独立 `trial_balances` 镜像行，不扣减原台账。A 使用 `SELECT FOR UPDATE` 持锁并写未提交回执；Python threading.Event 确保 B 在 A 持锁期间运行。B 先写自己的回执，再以指定 `lock_timeout` 请求同一行锁；PostgreSQL 返回 SQLSTATE 55P03 后完整 ROLLBACK。B 结束事件释放 A，A 扣减 remaining、增加 received 并 COMMIT。没有随机结果、sleep 假等待或假 SQL 计划。
@@ -44,18 +58,28 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 |服务|技术|职责|
 |---|---|---|
-|frontend|原生HTML/CSS/JS + Nginx|4业务页+登录，反向代理 /api/|
+|frontend|原生HTML/CSS/JS + Nginx|5业务页+登录，反向代理 /api/|
 |backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、持久化|
 |worker|Python3.11/psycopg|真实双连接锁竞争|
 |db|PostgreSQL16|业务数据、隔离镜像账本|
 |redis|Redis7|持久队列|
 
 目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。
-核心实体 Sample、Transfer、Trial 各有模型、schema、服务、路由、API、store与页面；共享 table/badge/frame 组件。共享枚举 roles/run states 位于后端 `src/constants/enums.py`、模型/权限引用和前端 `src/constants/enums.js`、frame/badge；状态枚举 queued/running/completed/failed。两个后端中间件：request_id/errors。
+核心实体 Sample、Transfer、Trial、InventoryCount/InventoryCountLine 各有模型、schema、服务、路由、API、store与页面；共享 table/badge/frame 组件。共享枚举 roles/run states 位于后端 `src/constants/enums.py`、模型/权限引用和前端 `src/constants/enums.js`、frame/badge；状态枚举 queued/running/completed/failed。两个后端中间件：request_id/errors。
 
 环境变量见 `.env.example`：COMPOSE_PROJECT_NAME、三端口、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅用于本地演示；JWT8小时有效。seed按自然键仅插入缺失行，不覆盖修改。所有5服务有健康检查，backend/worker依赖健康数据库/Redis，frontend依赖backend；db/redis/artifacts使用命名卷。停止及清空本项目数据：`docker compose down -v --remove-orphans`。
 
 本地开发：Python3.11安装 backend/requirements.txt；设置 DATABASE_URL/REDIS_URL 后 `uvicorn src.main:app --reload`（backend目录）；worker `python -m src.worker`；前端用Nginx同源代理后端。前端双字体经Google Fonts加载，离线使用浏览器字体回退；业务不依赖外部字体。
+
+## 测试
+
+`backend/tests/test_inventory_counts.py` 覆盖冻结快照与后续新增排除、日常改量、整批落账与超量申请失效、冻结后改量（含改回原值）整批拒绝、演练关联整批拒绝、落账与演练/改量并发、落账中断重试与幂等。需要 PostgreSQL 与 Redis：
+
+```sh
+cd backend
+TEST_DB=locklab_test TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=17742 TEST_REDIS_URL=redis://127.0.0.1:6379/9 \
+DATABASE_URL=postgresql+psycopg://locklab@127.0.0.1:17742/locklab_test python -m pytest tests -q
+```
 
 ## License
 MIT，见 LICENSE。测试脚本、截图与实际结果位于源码外 `../../test-artifacts/gb-4103/`。

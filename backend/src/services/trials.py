@@ -1,4 +1,3 @@
-import json
 from sqlalchemy import select
 from redis import Redis
 from fastapi import HTTPException
@@ -14,10 +13,17 @@ def detail(db,ident):
     if not obj: raise HTTPException(404,'演练不存在')
     return record(obj)
 def create(db,data,user):
-    transfer=db.get(Transfer,data.transfer_id)
+    # Lock the sample row first, the same order stocktake posting uses. If posting wins the
+    # race, this request waits and then sees the invalidated transfer; if this request wins,
+    # the posting sees the queued trial and rejects its whole batch.
+    probe=db.execute(select(Transfer).where(Transfer.id==data.transfer_id)).scalar_one_or_none()
+    if not probe: raise HTTPException(404,'流转申请不存在')
+    sample=db.get(Sample,probe.sample_id,with_for_update=True)
+    transfer=db.execute(select(Transfer).where(Transfer.id==data.transfer_id).with_for_update()).scalar_one_or_none()
     if not transfer: raise HTTPException(404,'流转申请不存在')
-    sample=db.get(Sample,transfer.sample_id)
-    if transfer.quantity>sample.quantity: raise HTTPException(422,'当前样本量不足')
+    if transfer.invalidated:
+        raise HTTPException(409,'该流转申请因盘点落账已失效，不能发起演练')
+    if transfer.quantity>sample.quantity: raise HTTPException(422,'当前样本量不足，不能发起演练')
     obj=Trial(**data.model_dump(),status=RUN_STATES[0])
     result=save(db,obj,user,'并发演练入队 '+data.name)
     db.add(TrialBalance(trial_id=obj.id,remaining=sample.quantity,received=0));db.commit()
